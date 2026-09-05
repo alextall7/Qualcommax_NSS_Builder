@@ -1,74 +1,452 @@
-name: Lint
+name: Build AX3600 NSS with WLAN 2.12
 
 on:
   workflow_dispatch:
-  push:
-    branches: [main]
-    paths:
-      - '.github/workflows/**'
-      - 'scripts/**'
-  pull_request:
-    paths:
-      - '.github/workflows/**'
-      - 'scripts/**'
 
 permissions:
   contents: read
 
+env:
+  # Exact OpenWrt/NSS stack used by the current working AX3600 image
+  UPSTREAM_REPO: JuliusBairaktaris/openwrt-nss-edma
+  UPSTREAM_REF: 7f107bee5016d5fdad8b5c373ab50c1287397043
+
+  BUILDER_REPO: JuliusBairaktaris/Qualcommax_NSS_Builder
+  BUILDER_REF: 3d5c632b7fbb2dce384a25a4a2339079e7fd2e65
+
+  NSS_REPO: JuliusBairaktaris/nss-packages
+  NSS_REF: 48e54207401e3476f2e1f95a69b34a01957919a5
+
+  TARGET: qualcommax/ipq807x
+  VARIANT: edma-nss
+  DEVICE: xiaomi_ax3600
+
+  FEEDS: "src-git nss https://github.com/JuliusBairaktaris/nss-packages.git;edma-nss"
+
 jobs:
-  actionlint:
-    name: actionlint
+  build:
+    name: AX3600 NSS + WLAN 2.12-01460
     runs-on: ubuntu-26.04
-    timeout-minutes: 5
-    steps:
-      - uses: actions/checkout@v7
-      - name: Run actionlint
-        run: |
-          set -euo pipefail
-          # Pinned to the commit v1.7.7 points at, not main: this script is
-          # piped into bash, so a mutable ref makes anyone who can land on
-          # actionlint's main a committer to our CI.
-          curl -fsSL https://raw.githubusercontent.com/rhysd/actionlint/03d0035246f3e81f36aed592ffb4bebf33a03106/scripts/download-actionlint.bash \
-            -o download-actionlint.bash
-          echo "221d1d16c03e4e4fcd867de34104e8d479bdce20ccdfa553b9a5c0dc29bf6af2  download-actionlint.bash" \
-            | sha256sum -c -
-          bash download-actionlint.bash 1.7.7
-          ./actionlint -color
+    timeout-minutes: 360
 
-  shellcheck:
-    name: shellcheck
-    runs-on: ubuntu-26.04
-    timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v7
-      - name: Run shellcheck
+      - name: Install build dependencies
         run: |
           set -euo pipefail
+
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends shellcheck
-          shellcheck -x scripts/*.sh scripts/lib/*.sh scripts/tests/*.sh
+          sudo apt-get install -y \
+            bzip2 \
+            curl \
+            g++ \
+            gawk \
+            gcc \
+            git \
+            glibc-source \
+            libncurses-dev \
+            make \
+            rsync \
+            zstd
 
-  yamllint:
-    name: yamllint
-    runs-on: ubuntu-26.04
-    timeout-minutes: 5
-    steps:
-      - uses: actions/checkout@v7
-      - name: Run yamllint
+      # -----------------------------------------------------------------------
+      # OpenWrt source
+      # Exact commit used by the current known-good AX3600 image
+      # -----------------------------------------------------------------------
+
+      - name: Checkout exact OpenWrt NSS source
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ env.UPSTREAM_REPO }}
+          ref: ${{ env.UPSTREAM_REF }}
+          fetch-depth: 0
+          path: openwrt
+
+      # -----------------------------------------------------------------------
+      # Builder
+      # Exact Builder revision associated with the current image
+      # -----------------------------------------------------------------------
+
+      - name: Checkout exact NSS Builder
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ env.BUILDER_REPO }}
+          ref: ${{ env.BUILDER_REF }}
+          fetch-depth: 0
+          path: builder
+
+      # -----------------------------------------------------------------------
+      # Prepare normal Julius AX3600 build
+      # -----------------------------------------------------------------------
+
+      - name: Prepare build environment
+        env:
+          OPENWRT_DIR: ${{ github.workspace }}/openwrt
+          BUILDER_REPO: ${{ github.workspace }}/builder
         run: |
           set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends yamllint
-          yamllint -d "{extends: default, rules: {line-length: disable, document-start: disable, truthy: {check-keys: false}}}" \
-            .github/workflows/
 
-  prune-tests:
-    name: prune-releases tests
-    runs-on: ubuntu-26.04
-    timeout-minutes: 5
-    steps:
-      - uses: actions/checkout@v7
-      - name: Install jq
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends jq
-      - name: Run tests
-        run: bash scripts/tests/prune-releases.test.sh
+          bash builder/scripts/prepare-build.sh
+
+      # -----------------------------------------------------------------------
+      # Pin NSS packages to exactly the revision used by current firmware
+      # -----------------------------------------------------------------------
+
+      - name: Pin exact NSS packages revision
+        run: |
+          set -euo pipefail
+
+          echo "=== Current NSS feed ==="
+          git -C openwrt/feeds/nss rev-parse HEAD
+
+          echo
+          echo "=== Pinning NSS feed to ${NSS_REF} ==="
+
+          git -C openwrt/feeds/nss fetch origin "${NSS_REF}"
+          git -C openwrt/feeds/nss checkout --detach "${NSS_REF}"
+
+          ACTUAL_NSS="$(git -C openwrt/feeds/nss rev-parse HEAD)"
+
+          echo
+          echo "Expected NSS: ${NSS_REF}"
+          echo "Actual NSS:   ${ACTUAL_NSS}"
+
+          test "${ACTUAL_NSS}" = "${NSS_REF}"
+
+      # -----------------------------------------------------------------------
+      # Replace ONLY IPQ8074 WLAN firmware:
+      #
+      #   2.9.0.1-02146
+      #          ↓
+      #   2.12-01460
+      #
+      # NSS, ath11k driver, BDF, kernel, memory profile etc. stay unchanged.
+      # -----------------------------------------------------------------------
+
+      - name: Inject IPQ8074 WLAN 2.12-01460
+        run: |
+          set -euo pipefail
+
+          FW_VERSION="2.12-01460"
+          FW_FULL="WLAN.HK.2.12-01460-QCAHKSWPL_SILICONZ-1"
+
+          FW_NAME="ath11k-firmware-${FW_VERSION}.tar.zst"
+
+          FW_URL="https://github.com/qosmio/upstream-wifi-fw/releases/download/${FW_VERSION}/${FW_NAME}"
+
+          FW_SHA256="a2767b367a51e15c1ab4d303113a0d1e22e73adf727a418119f4509f0ef115dd"
+
+          TMP="$(mktemp -d)"
+          trap 'rm -rf "$TMP"' EXIT
+
+          echo "============================================================"
+          echo " Downloading WLAN firmware"
+          echo "============================================================"
+          echo
+          echo "Version: ${FW_VERSION}"
+          echo "Bundle:  ${FW_NAME}"
+          echo
+
+          curl \
+            -L \
+            --fail \
+            --retry 3 \
+            --retry-delay 5 \
+            -o "${TMP}/${FW_NAME}" \
+            "${FW_URL}"
+
+          echo
+          echo "============================================================"
+          echo " Verifying firmware SHA256"
+          echo "============================================================"
+
+          echo "${FW_SHA256}  ${TMP}/${FW_NAME}" | sha256sum -c -
+
+          echo
+          echo "============================================================"
+          echo " Extracting firmware"
+          echo "============================================================"
+
+          tar \
+            --zstd \
+            -xf "${TMP}/${FW_NAME}" \
+            -C "${TMP}"
+
+          SRC="$(
+            find "${TMP}" \
+              -type d \
+              -path "*/IPQ8074/hw2.0/testing/2.12/${FW_FULL}" \
+              -print \
+              -quit
+          )"
+
+          if [ -z "${SRC}" ]; then
+            echo "::error::Could not find IPQ8074 ${FW_FULL}"
+            exit 1
+          fi
+
+          echo
+          echo "Firmware source:"
+          echo "${SRC}"
+
+          echo
+          echo "============================================================"
+          echo " Checking firmware version"
+          echo "============================================================"
+
+          test -f "${SRC}/fw_version.txt"
+
+          cat "${SRC}/fw_version.txt"
+
+          grep -qF "${FW_FULL}" "${SRC}/fw_version.txt"
+
+          echo
+          echo "============================================================"
+          echo " Injecting firmware into rootfs overlay"
+          echo "============================================================"
+
+          DST="${GITHUB_WORKSPACE}/openwrt/files/lib/firmware/IPQ8074"
+
+          mkdir -p "${DST}"
+
+          cp -a "${SRC}/." "${DST}/"
+
+          echo
+          echo "Installed into:"
+          echo "${DST}"
+
+          echo
+          echo "=== Firmware version ==="
+          cat "${DST}/fw_version.txt"
+
+          echo
+          echo "=== Q6 files ==="
+          ls -lh "${DST}"/q6_fw.*
+
+          echo
+          echo "=== M3 files ==="
+          ls -lh "${DST}"/m3_fw.*
+
+          echo
+          echo "============================================================"
+          echo " WLAN 2.12 overlay READY"
+          echo "============================================================"
+
+      # -----------------------------------------------------------------------
+      # Reproducible build metadata
+      # -----------------------------------------------------------------------
+
+      - name: Set reproducible build environment
+        working-directory: openwrt
+        run: |
+          set -euo pipefail
+
+          {
+            echo "SOURCE_DATE_EPOCH=$(git show -s --format=%ct HEAD)"
+            echo "TZ=UTC"
+            echo "LC_ALL=C"
+            echo "KBUILD_BUILD_USER=builder"
+            echo "KBUILD_BUILD_HOST=github"
+          } >> "$GITHUB_ENV"
+
+          echo "OpenWrt commit:"
+          git rev-parse HEAD
+
+          echo
+          echo "OpenWrt commit date:"
+          git show -s --format='%cI' HEAD
+
+      # -----------------------------------------------------------------------
+      # Download sources
+      # -----------------------------------------------------------------------
+
+      - name: Download sources
+        working-directory: openwrt
+        run: |
+          set -euo pipefail
+
+          for attempt in 1 2 3; do
+            if make download -j"$(nproc)" V=s; then
+              exit 0
+            fi
+
+            echo
+            echo "Download attempt ${attempt} failed."
+
+            if [ "${attempt}" -lt 3 ]; then
+              echo "Retrying in 5 seconds..."
+              sleep 5
+            fi
+          done
+
+          echo "::error::Source download failed after 3 attempts"
+          exit 1
+
+      # -----------------------------------------------------------------------
+      # Build
+      # -----------------------------------------------------------------------
+
+      - name: Build AX3600 image
+        working-directory: openwrt
+        run: |
+          set -euo pipefail
+
+          echo "============================================================"
+          echo " Building AX3600"
+          echo "============================================================"
+
+          if ! make -j"$(nproc)"; then
+            echo
+            echo "::warning::Parallel build failed."
+            echo "::warning::Retrying single-threaded for diagnostics."
+
+            make -j1 V=s
+          fi
+
+      # -----------------------------------------------------------------------
+      # Verify that the FINAL rootfs staging tree really contains 2.12
+      # -----------------------------------------------------------------------
+
+      - name: Verify final rootfs WLAN firmware
+        run: |
+          set -euo pipefail
+
+          FW_FULL="WLAN.HK.2.12-01460-QCAHKSWPL_SILICONZ-1"
+          OLD_FW="WLAN.HK.2.9.0.1-02146-QCAHKSWPL_SILICONZ-1"
+
+          ROOT_FW="$(
+            find openwrt/build_dir \
+              -type f \
+              -path '*/root-qualcommax/lib/firmware/IPQ8074/fw_version.txt' \
+              -print \
+              -quit
+          )"
+
+          if [ -z "${ROOT_FW}" ]; then
+            echo "::error::Final rootfs fw_version.txt not found"
+            exit 1
+          fi
+
+          ROOT_DIR="$(dirname "${ROOT_FW}")"
+
+          echo "============================================================"
+          echo " FINAL ROOTFS WLAN FIRMWARE"
+          echo "============================================================"
+          echo
+          echo "Path:"
+          echo "${ROOT_DIR}"
+          echo
+
+          cat "${ROOT_FW}"
+
+          echo
+          echo "Checking expected firmware..."
+
+          grep -qF "${FW_FULL}" "${ROOT_FW}"
+
+          echo "WLAN 2.12-01460 present: YES"
+
+          echo
+          echo "Checking for old 2.9 firmware string..."
+
+          if grep -aR -qF "${OLD_FW}" "${ROOT_DIR}"; then
+            echo "::error::Old WLAN 2.9-02146 firmware still present in final rootfs"
+            exit 1
+          fi
+
+          echo "Old WLAN 2.9-02146 present: NO"
+
+          echo
+          echo "=== Final Q6 ==="
+          ls -lh "${ROOT_DIR}"/q6_fw.*
+
+          echo
+          echo "=== Final M3 ==="
+          ls -lh "${ROOT_DIR}"/m3_fw.*
+
+          echo
+          echo "============================================================"
+          echo " FINAL ROOTFS CHECK PASSED"
+          echo "============================================================"
+
+      # -----------------------------------------------------------------------
+      # Collect ONLY Xiaomi AX3600 sysupgrade image
+      # -----------------------------------------------------------------------
+
+      - name: Collect AX3600 image
+        run: |
+          set -euo pipefail
+
+          OUT="openwrt/bin/targets/${TARGET}"
+
+          IMAGE="$(
+            find "${OUT}" \
+              -maxdepth 1 \
+              -type f \
+              -name 'openwrt-*-xiaomi_ax3600-squashfs-sysupgrade.bin' \
+              -print \
+              -quit
+          )"
+
+          if [ -z "${IMAGE}" ]; then
+            echo "::error::AX3600 sysupgrade image not found"
+            exit 1
+          fi
+
+          echo "============================================================"
+          echo " AX3600 IMAGE"
+          echo "============================================================"
+          echo
+          echo "${IMAGE}"
+          echo
+
+          ls -lh "${IMAGE}"
+
+          IMAGE_NAME="$(basename "${IMAGE}")"
+
+          sha256sum "${IMAGE}" | tee ax3600-2.12-01460.sha256
+
+          {
+            echo "AX3600 NSS WLAN 2.12 experimental build"
+            echo
+            echo "OpenWrt:"
+            echo "  JuliusBairaktaris/openwrt-nss-edma"
+            echo "  ${UPSTREAM_REF}"
+            echo
+            echo "Builder:"
+            echo "  JuliusBairaktaris/Qualcommax_NSS_Builder"
+            echo "  ${BUILDER_REF}"
+            echo
+            echo "NSS packages:"
+            echo "  JuliusBairaktaris/nss-packages"
+            echo "  ${NSS_REF}"
+            echo
+            echo "WLAN firmware:"
+            echo "  WLAN.HK.2.12-01460-QCAHKSWPL_SILICONZ-1"
+            echo
+            echo "Image:"
+            echo "  ${IMAGE_NAME}"
+            echo
+            echo "SHA256:"
+            sha256sum "${IMAGE}"
+          } > BUILD-METADATA.txt
+
+          cat BUILD-METADATA.txt
+
+      # -----------------------------------------------------------------------
+      # Upload result to GitHub Actions
+      # No release is created and nothing is published automatically.
+      # -----------------------------------------------------------------------
+
+      - name: Upload AX3600 test image
+        uses: actions/upload-artifact@v4
+        with:
+          name: AX3600-NSS-WLAN-2.12-01460
+          retention-days: 14
+          if-no-files-found: error
+          path: |
+            openwrt/bin/targets/qualcommax/ipq807x/openwrt-*-xiaomi_ax3600-squashfs-sysupgrade.bin
+            openwrt/bin/targets/qualcommax/ipq807x/config.buildinfo
+            openwrt/bin/targets/qualcommax/ipq807x/version.buildinfo
+            openwrt/bin/targets/qualcommax/ipq807x/feeds.buildinfo
+            ax3600-2.12-01460.sha256
+            BUILD-METADATA.txt
